@@ -21,6 +21,8 @@ import io.github.project.openubl.ublhub.documents.exceptions.NoUBLXMLFileComplia
 import io.github.project.openubl.ublhub.documents.exceptions.ProjectNotFoundException;
 import io.github.project.openubl.ublhub.files.FilesManager;
 import io.github.project.openubl.ublhub.files.UblhubFileConstants;
+import io.github.project.openubl.ublhub.models.JobPhaseType;
+import io.github.project.openubl.ublhub.models.JobRecoveryActionType;
 import io.github.project.openubl.ublhub.models.jpa.entities.SunatEntity;
 import io.github.project.openubl.xbuilder.content.models.standard.general.CreditNote;
 import io.github.project.openubl.xbuilder.content.models.standard.general.DebitNote;
@@ -43,6 +45,7 @@ import io.github.project.openubl.xsender.models.Status;
 import io.github.project.openubl.xsender.models.Sunat;
 import io.github.project.openubl.xsender.models.SunatResponse;
 import io.github.project.openubl.xsender.sunat.BillServiceDestination;
+import org.apache.camel.Exchange;
 import org.apache.camel.ExchangePattern;
 import org.apache.camel.LoggingLevel;
 import org.apache.camel.ValidationException;
@@ -51,6 +54,7 @@ import org.apache.camel.component.jackson.JacksonDataFormat;
 import org.apache.camel.model.dataformat.JsonLibrary;
 import org.apache.camel.support.builder.Namespaces;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
+import org.jboss.logging.Logger;
 import org.xml.sax.SAXParseException;
 
 import javax.enterprise.context.ApplicationScoped;
@@ -59,12 +63,16 @@ import javax.json.JsonObject;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
 
 import static io.github.project.openubl.xsender.camel.utils.CamelUtils.getBillServiceCamelData;
 
 @ApplicationScoped
 public class DocumentRoute extends RouteBuilder {
+
+    private static final Logger LOG = Logger.getLogger(DocumentRoute.class);
 
     public static final String DOCUMENT_KIND = "kind";
     public static final String DOCUMENT_PROJECT = "project";
@@ -79,6 +87,12 @@ public class DocumentRoute extends RouteBuilder {
     public static final String SUNAT_RESPONSE = "sunatResponse";
     public static final String SUNAT_TICKET = "sunatTicket";
     public static final String SUNAT_GRE_REST = "sunatGreRest";
+    public static final String JOB_PHASE = "jobPhase";
+    public static final String JOB_RECOVERY_ACTION = "jobRecoveryAction";
+    private static final String SUNAT_SOAP_URL = "sunatSoapUrl";
+    private static final String SUNAT_SOAP_OPERATION = "sunatSoapOperation";
+    private static final String SUNAT_REQUEST_DISPATCHED = "sunatRequestDispatched";
+    private static final String SUNAT_CONNECTOR_RETURNED = "sunatConnectorReturned";
 
     @Inject
     SunatGreRestClient sunatGreRestClient;
@@ -120,6 +134,12 @@ public class DocumentRoute extends RouteBuilder {
 
     @Override
     public void configure() throws Exception {
+        onException(Throwable.class)
+                .onWhen(header(DOCUMENT_ID).isNotNull())
+                .handled(true)
+                .process(this::logSunatFailure)
+                .bean("documentBean", "saveFailure");
+
         // Requires body=java.json.JsonObject + Optional DOCUMENT_PROJECT
         from("direct:import-json")
                 .id("import-json")
@@ -332,6 +352,8 @@ public class DocumentRoute extends RouteBuilder {
         from("direct:send-xml")
                 .id("send-xml")
                 .setHeader(DOCUMENT_ID, body())
+                .setHeader(JOB_PHASE, constant(JobPhaseType.READ_XML_FILE))
+                .setHeader(JOB_RECOVERY_ACTION, constant(JobRecoveryActionType.RETRY_SEND))
                 .bean("documentBean", "fetchDocument")
 
                 .setBody(header(DocumentRoute.DOCUMENT_FILE_ID))
@@ -347,14 +369,7 @@ public class DocumentRoute extends RouteBuilder {
                     .endChoice()
                 .end()
                 .bean("documentBean", "saveXmlData")
-                .onException(NoUBLXMLFileCompliantException.class)
-                    .setBody(exchange -> DocumentImportResult.builder()
-                            .errorMessage("No valid UBL XML file")
-                            .build()
-                    )
-                    .handled(true)
-                .end()
-
+                .setHeader(JOB_PHASE, constant(JobPhaseType.SEND_XML_FILE))
                 .bean("documentBean", "getSunatData")
                 .process(exchange -> {
                     byte[] documentFile = exchange.getIn().getHeader(DOCUMENT_FILE, byte[].class);
@@ -363,6 +378,7 @@ public class DocumentRoute extends RouteBuilder {
 
                     if (isGreRest(xmlContent, documentSunatData)) {
                         exchange.getIn().setHeader(SUNAT_GRE_REST, true);
+                        exchange.getIn().setHeader(JOB_RECOVERY_ACTION, JobRecoveryActionType.RETRY_FETCH_CDR);
                         try {
                             SunatGreRestClient.GreResponse response = sunatGreRestClient.submit(
                                     documentFile,
@@ -371,19 +387,17 @@ public class DocumentRoute extends RouteBuilder {
                                     documentSunatData
                             );
                             exchange.getIn().setBody(toSunatResponse(response));
-                        } catch (Exception error) {
-                            if (error instanceof InterruptedException) {
-                                Thread.currentThread().interrupt();
-                            }
-                            exchange.getIn().setBody(greFailure(error));
+                        } catch (InterruptedException error) {
+                            Thread.currentThread().interrupt();
+                            throw error;
                         }
                         return;
                     }
 
                     CompanyURLs urls = CompanyURLs.builder()
-                            .invoice(documentSunatData.getSunatUrlFactura())
-                            .perceptionRetention(documentSunatData.getSunatUrlPercepcionRetencion())
-                            .despatch(documentSunatData.getSunatUrlGuiaRemision())
+                            .invoice(normalizeSunatServiceUrl(documentSunatData.getSunatUrlFactura()))
+                            .perceptionRetention(normalizeSunatServiceUrl(documentSunatData.getSunatUrlPercepcionRetencion()))
+                            .despatch(normalizeSunatServiceUrl(documentSunatData.getSunatUrlGuiaRemision()))
                             .build();
                     CompanyCredentials credentials = CompanyCredentials.builder()
                             .username(documentSunatData.getSunatUsername())
@@ -396,39 +410,39 @@ public class DocumentRoute extends RouteBuilder {
                     BillServiceDestination fileDestination = fileAnalyzer.getSendFileDestination();
                     CamelData camelFileData = getBillServiceCamelData(zipFile, fileDestination, credentials);
 
+                    exchange.setProperty(SUNAT_SOAP_URL, resolveSunatUrl(fileDestination, documentSunatData));
+                    exchange.setProperty(SUNAT_SOAP_OPERATION, String.valueOf(fileDestination));
                     exchange.getIn().setBody(camelFileData.getBody());
                     camelFileData.getHeaders().forEach((k, v) -> exchange.getIn().setHeader(k, v));
                 })
 
-                .doTry()
-                    .choice()
-                        .when(header(SUNAT_GRE_REST).isEqualTo(true))
-                            .log(LoggingLevel.DEBUG, "GRE submitted using SUNAT REST")
-                        .endChoice()
-                        .otherwise()
-                            .to(Constants.XSENDER_BILL_SERVICE_URI)
-                        .endChoice()
-                    .endDoTry()
-                .doCatch(Throwable.class)
-                    .setBody(exchange -> SunatResponse.builder()
-                            .status(Status.UNKNOWN)
-                            .metadata(Metadata.builder()
-                                    .notes(Collections.emptyList())
-                                    .description("Exception al enviar XML")
-                                    .build())
-                            .build()
-                    )
+                .setHeader(JOB_RECOVERY_ACTION, constant(JobRecoveryActionType.RETRY_FETCH_CDR))
+                .choice()
+                    .when(header(SUNAT_GRE_REST).isEqualTo(true))
+                        .log(LoggingLevel.DEBUG, "GRE submitted using SUNAT REST")
+                    .endChoice()
+                    .otherwise()
+                        .process(this::logSoapRequest)
+                        .to(Constants.XSENDER_BILL_SERVICE_URI)
+                        .process(this::logSoapResponse)
+                    .endChoice()
                 .end()
 
                 .process(exchange -> {
                     SunatResponse sunatResponse = exchange.getIn().getBody(SunatResponse.class);
+                    if (sunatResponse == null) {
+                        Object responseBody = exchange.getIn().getBody();
+                        String responseType = responseBody != null ? responseBody.getClass().getName() : "null";
+                        throw new IllegalStateException(
+                                "SUNAT connector returned no valid SunatResponse (bodyType=" + responseType
+                                        + ", httpStatus=" + safeHeader(exchange, "CamelHttpResponseCode") + ")"
+                        );
+                    }
 
-                    byte[] cdrFile = Optional.ofNullable(sunatResponse)
-                            .flatMap(response -> Optional.ofNullable(response.getSunat()))
+                    byte[] cdrFile = Optional.ofNullable(sunatResponse.getSunat())
                             .map(Sunat::getCdr)
                             .orElse(null);
-                    String ticket = Optional.ofNullable(sunatResponse)
-                            .flatMap(response -> Optional.ofNullable(response.getSunat()))
+                    String ticket = Optional.ofNullable(sunatResponse.getSunat())
                             .map(Sunat::getTicket)
                             .orElse(null);
 
@@ -466,6 +480,8 @@ public class DocumentRoute extends RouteBuilder {
         from("direct:verify-ticket")
                 .id("verify-ticket")
                 .setHeader(DOCUMENT_ID, body())
+                .setHeader(JOB_PHASE, constant(JobPhaseType.VERIFY_TICKET))
+                .setHeader(JOB_RECOVERY_ACTION, constant(JobRecoveryActionType.RETRY_FETCH_CDR))
                 .bean("documentBean", "fetchDocument")
                 .bean("documentBean", "getSunatData")
 
@@ -494,9 +510,9 @@ public class DocumentRoute extends RouteBuilder {
                     }
 
                     CompanyURLs urls = CompanyURLs.builder()
-                            .invoice(documentSunatData.getSunatUrlFactura())
-                            .perceptionRetention(documentSunatData.getSunatUrlPercepcionRetencion())
-                            .despatch(documentSunatData.getSunatUrlGuiaRemision())
+                            .invoice(normalizeSunatServiceUrl(documentSunatData.getSunatUrlFactura()))
+                            .perceptionRetention(normalizeSunatServiceUrl(documentSunatData.getSunatUrlPercepcionRetencion()))
+                            .despatch(normalizeSunatServiceUrl(documentSunatData.getSunatUrlGuiaRemision()))
                             .build();
                     CompanyCredentials credentials = CompanyCredentials.builder()
                             .username(documentSunatData.getSunatUsername())
@@ -508,35 +524,35 @@ public class DocumentRoute extends RouteBuilder {
                     BillServiceDestination ticketDestination = fileAnalyzer.getVerifyTicketDestination();
                     CamelData camelTicketData = getBillServiceCamelData(ticket, ticketDestination, credentials);
 
+                    exchange.setProperty(SUNAT_SOAP_URL, resolveSunatUrl(ticketDestination, documentSunatData));
+                    exchange.setProperty(SUNAT_SOAP_OPERATION, String.valueOf(ticketDestination));
                     exchange.getIn().setBody(camelTicketData.getBody());
                     camelTicketData.getHeaders().forEach((k, v) -> exchange.getIn().setHeader(k, v));
                 })
 
-                .doTry()
-                    .choice()
-                        .when(header(SUNAT_GRE_REST).isEqualTo(true))
-                            .log(LoggingLevel.DEBUG, "GRE ticket verified using SUNAT REST")
-                        .endChoice()
-                        .otherwise()
-                            .to(Constants.XSENDER_BILL_SERVICE_URI)
-                        .endChoice()
-                    .endDoTry()
-                .doCatch(Throwable.class)
-                .setBody(exchange -> SunatResponse.builder()
-                        .status(Status.UNKNOWN)
-                        .metadata(Metadata.builder()
-                                .notes(Collections.emptyList())
-                                .description("Exception al verificar ticket")
-                                .build())
-                        .build()
-                )
+                .choice()
+                    .when(header(SUNAT_GRE_REST).isEqualTo(true))
+                        .log(LoggingLevel.DEBUG, "GRE ticket verified using SUNAT REST")
+                    .endChoice()
+                    .otherwise()
+                        .process(this::logSoapRequest)
+                        .to(Constants.XSENDER_BILL_SERVICE_URI)
+                        .process(this::logSoapResponse)
+                    .endChoice()
                 .end()
 
                 .process(exchange -> {
                     SunatResponse sunatResponse = exchange.getIn().getBody(SunatResponse.class);
+                    if (sunatResponse == null) {
+                        Object responseBody = exchange.getIn().getBody();
+                        String responseType = responseBody != null ? responseBody.getClass().getName() : "null";
+                        throw new IllegalStateException(
+                                "SUNAT connector returned no valid ticket response (bodyType=" + responseType
+                                        + ", httpStatus=" + safeHeader(exchange, "CamelHttpResponseCode") + ")"
+                        );
+                    }
 
-                    byte[] cdrFile = Optional.ofNullable(sunatResponse)
-                            .flatMap(response -> Optional.ofNullable(response.getSunat()))
+                    byte[] cdrFile = Optional.ofNullable(sunatResponse.getSunat())
                             .map(Sunat::getCdr)
                             .orElse(null);
 
@@ -556,6 +572,124 @@ public class DocumentRoute extends RouteBuilder {
                         .bean("documentBean", "saveCdr")
                     .endChoice()
                 .end();
+    }
+
+    private void logSoapRequest(Exchange exchange) {
+        exchange.setProperty(SUNAT_REQUEST_DISPATCHED, true);
+        exchange.setProperty(SUNAT_CONNECTOR_RETURNED, false);
+        Object body = exchange.getIn().getBody();
+        LOG.infof(
+                "SUNAT SOAP dispatch started document=%s phase=%s url=%s operation=%s bodyType=%s headers={%s}",
+                exchange.getIn().getHeader(DOCUMENT_ID),
+                exchange.getIn().getHeader(JOB_PHASE),
+                safeLogValue(exchange.getProperty(SUNAT_SOAP_URL)),
+                safeLogValue(exchange.getProperty(SUNAT_SOAP_OPERATION)),
+                body != null ? body.getClass().getName() : "null",
+                diagnosticHeaders(exchange)
+        );
+    }
+
+    private void logSoapResponse(Exchange exchange) {
+        exchange.setProperty(SUNAT_CONNECTOR_RETURNED, true);
+        Object body = exchange.getIn().getBody();
+        LOG.infof(
+                "SUNAT SOAP connector returned document=%s phase=%s url=%s operation=%s bodyType=%s httpStatus=%s httpText=%s headers={%s}",
+                exchange.getIn().getHeader(DOCUMENT_ID),
+                exchange.getIn().getHeader(JOB_PHASE),
+                safeLogValue(exchange.getProperty(SUNAT_SOAP_URL)),
+                safeLogValue(exchange.getProperty(SUNAT_SOAP_OPERATION)),
+                body != null ? body.getClass().getName() : "null",
+                safeHeader(exchange, "CamelHttpResponseCode"),
+                safeHeader(exchange, "CamelHttpResponseText"),
+                diagnosticHeaders(exchange)
+        );
+    }
+
+    private void logSunatFailure(Exchange exchange) {
+        if (exchange.getProperty(SUNAT_REQUEST_DISPATCHED) == null) {
+            return;
+        }
+        Throwable failure = exchange.getProperty(Exchange.EXCEPTION_CAUGHT, Throwable.class);
+        LOG.errorf(
+                failure,
+                "SUNAT SOAP dispatch failed document=%s phase=%s url=%s operation=%s dispatched=%s connectorReturned=%s httpStatus=%s headers={%s}",
+                exchange.getIn().getHeader(DOCUMENT_ID),
+                exchange.getIn().getHeader(JOB_PHASE),
+                safeLogValue(exchange.getProperty(SUNAT_SOAP_URL)),
+                safeLogValue(exchange.getProperty(SUNAT_SOAP_OPERATION)),
+                exchange.getProperty(SUNAT_REQUEST_DISPATCHED),
+                exchange.getProperty(SUNAT_CONNECTOR_RETURNED),
+                safeHeader(exchange, "CamelHttpResponseCode"),
+                diagnosticHeaders(exchange)
+        );
+    }
+
+    private static String diagnosticHeaders(Exchange exchange) {
+        StringBuilder result = new StringBuilder();
+        for (Map.Entry<String, Object> entry : exchange.getIn().getHeaders().entrySet()) {
+            String key = entry.getKey();
+            String normalized = key.toLowerCase(Locale.ROOT);
+            boolean diagnostic = normalized.contains("operation")
+                    || normalized.contains("soapaction")
+                    || normalized.contains("endpoint")
+                    || normalized.contains("destination")
+                    || normalized.contains("address")
+                    || normalized.contains("url")
+                    || normalized.contains("uri")
+                    || normalized.contains("responsecode")
+                    || normalized.contains("responsetext")
+                    || normalized.contains("fault");
+            boolean sensitive = normalized.contains("authorization")
+                    || normalized.contains("password")
+                    || normalized.contains("credential")
+                    || normalized.contains("token")
+                    || normalized.contains("secret")
+                    || normalized.contains("username");
+            if (!diagnostic || sensitive || entry.getValue() instanceof byte[]
+                    || entry.getValue() instanceof Map<?, ?>
+                    || entry.getValue() instanceof Iterable<?>) {
+                continue;
+            }
+            if (result.length() > 0) {
+                result.append(", ");
+            }
+            result.append(key).append('=').append(safeLogValue(entry.getValue()));
+        }
+        return result.length() == 0 ? "none" : result.toString();
+    }
+
+    private static String safeHeader(Exchange exchange, String name) {
+        return safeLogValue(exchange.getIn().getHeader(name));
+    }
+
+    private static String safeLogValue(Object value) {
+        if (value == null) {
+            return "unknown";
+        }
+        String safe = String.valueOf(value)
+                .replaceAll("(?i)(client_secret|password|access_token|client_id|authorization)=([^&\\s]+)", "$1=***")
+                .replaceAll("(?i)Bearer\\s+[A-Za-z0-9._~+/-]+=*", "Bearer ***")
+                .replaceAll("[\\r\\n\\t]+", " ")
+                .trim();
+        return safe.length() > 500 ? safe.substring(0, 500) : safe;
+    }
+
+    private static String resolveSunatUrl(BillServiceDestination destination, SunatEntity config) {
+        String operation = String.valueOf(destination).toUpperCase(Locale.ROOT);
+        if (operation.contains("DESPATCH") || operation.contains("GUIA")) {
+            return normalizeSunatServiceUrl(config.getSunatUrlGuiaRemision());
+        }
+        if (operation.contains("PERCEPTION") || operation.contains("RETENTION")) {
+            return normalizeSunatServiceUrl(config.getSunatUrlPercepcionRetencion());
+        }
+        return normalizeSunatServiceUrl(config.getSunatUrlFactura());
+    }
+
+    private static String normalizeSunatServiceUrl(String url) {
+        if (url == null) {
+            return null;
+        }
+        return url.replaceFirst("(?i)\\?wsdl$", "");
     }
 
     private static boolean isGreRest(XmlContent xmlContent, SunatEntity config) {
@@ -589,24 +723,6 @@ public class DocumentRoute extends RouteBuilder {
                 .metadata(Metadata.builder()
                         .responseCode(code)
                         .description(response.description())
-                        .notes(Collections.emptyList())
-                        .build())
-                .build();
-    }
-
-    private static SunatResponse greFailure(Exception error) {
-        String description = Optional.ofNullable(error.getMessage())
-                .orElse(error.getClass().getSimpleName())
-                .replaceAll("(?i)(client_secret|password|access_token)=?[^\\s&]+", "$1=***")
-                .replaceAll("(?i)Bearer\\s+[A-Za-z0-9._-]+", "Bearer ***");
-        if (description.length() > 1000) {
-            description = description.substring(0, 1000);
-        }
-        return SunatResponse.builder()
-                .status(Status.UNKNOWN)
-                .metadata(Metadata.builder()
-                        .responseCode(-1)
-                        .description(description)
                         .notes(Collections.emptyList())
                         .build())
                 .build();

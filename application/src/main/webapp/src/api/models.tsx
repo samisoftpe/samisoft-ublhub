@@ -126,7 +126,7 @@ export interface DocumentStatusSunatDto {
 export interface DocumentStatusErrorDto {
   phase: string;
   description: string;
-  recoveryActionCount: string;
+  recoveryActionCount: number;
   recoveryAction: string;
 }
 

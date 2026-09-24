@@ -33,6 +33,7 @@ public interface DocumentMapper {
 
     @Mapping(target = "status.sunat", source = "sunatResponse")
     @Mapping(target = "status.error", source = "error")
+    @Mapping(target = "status.error.recoveryActionCount", source = "error.count")
     DocumentDto toDto(UBLDocumentEntity entity);
 
     @AfterMapping

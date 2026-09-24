@@ -24,6 +24,8 @@ import io.github.project.openubl.ublhub.documents.exceptions.ProjectNotFoundExce
 import io.github.project.openubl.ublhub.keys.KeyManager;
 import io.github.project.openubl.ublhub.keys.component.ComponentOwner;
 import io.github.project.openubl.ublhub.mapper.XmlContentMapper;
+import io.github.project.openubl.ublhub.models.JobPhaseType;
+import io.github.project.openubl.ublhub.models.JobRecoveryActionType;
 import io.github.project.openubl.ublhub.models.jpa.CompanyRepository;
 import io.github.project.openubl.ublhub.models.jpa.ProjectRepository;
 import io.github.project.openubl.ublhub.models.jpa.UBLDocumentRepository;
@@ -48,6 +50,7 @@ import io.smallrye.common.annotation.Blocking;
 import org.apache.camel.Body;
 import org.apache.camel.Exchange;
 import org.apache.camel.Header;
+import org.jboss.logging.Logger;
 import org.keycloak.crypto.Algorithm;
 import org.keycloak.crypto.KeyUse;
 import org.keycloak.crypto.KeyWrapper;
@@ -81,6 +84,9 @@ import java.util.Optional;
 @Named("documentBean")
 @RegisterForReflection
 public class DocumentBean {
+
+    private static final Logger LOG = Logger.getLogger(DocumentBean.class);
+    private static final int MAX_ERROR_DESCRIPTION_LENGTH = 255;
 
     @Inject
     TsidFactory tsidFactory;
@@ -332,6 +338,12 @@ public class DocumentBean {
         if (sunatEntity == null) {
             sunatEntity = projectRepository.findById(project).getSunat();
         }
+        if (sunatEntity == null) {
+            throw new IllegalStateException(
+                    "SUNAT configuration was not found for project " + project
+                            + " and RUC " + xmlContent.getRuc()
+            );
+        }
 
         exchange.getIn().setHeader(DocumentRoute.DOCUMENT_SUNAT_DATA, sunatEntity);
     }
@@ -362,8 +374,79 @@ public class DocumentBean {
                 || sunatResponse.getStatus() == io.github.project.openubl.xsender.models.Status.UNKNOWN
                 || sunatResponse.getStatus() == io.github.project.openubl.xsender.models.Status.EN_PROCESO);
         documentEntity.setJobInProgress(shouldVerifyTicket);
+        documentEntity.setError(null);
 
         documentEntity.persist();
+    }
+
+    @Transactional
+    public void saveFailure(
+            @Header(DocumentRoute.DOCUMENT_ID) Long documentId,
+            @Header(DocumentRoute.JOB_PHASE) JobPhaseType phase,
+            @Header(DocumentRoute.JOB_RECOVERY_ACTION) JobRecoveryActionType recoveryAction,
+            Exchange exchange
+    ) {
+        Throwable failure = exchange.getProperty(Exchange.EXCEPTION_CAUGHT, Throwable.class);
+        String description = failureDescription(failure);
+        JobPhaseType effectivePhase = phase != null ? phase : JobPhaseType.SEND_XML_FILE;
+
+        LOG.errorf(
+                "Document %s failed during %s (%s): %s",
+                documentId,
+                effectivePhase,
+                failure != null ? failure.getClass().getName() : "unknown failure",
+                description
+        );
+
+        UBLDocumentEntity documentEntity = documentRepository.findById(documentId);
+        if (documentEntity == null) {
+            LOG.errorf("Could not persist failure because document %s was not found", documentId);
+            return;
+        }
+
+        int failureCount = Optional.ofNullable(documentEntity.getError())
+                .map(ErrorEntity::getCount)
+                .orElse(0) + 1;
+        documentEntity.setError(ErrorEntity.builder()
+                .phase(effectivePhase)
+                .description(description)
+                .recoveryAction(recoveryAction)
+                .count(failureCount)
+                .build());
+        documentEntity.setJobInProgress(false);
+
+        if (documentEntity.getSunatResponse() == null) {
+            documentEntity.setSunatResponse(new SUNATResponseEntity());
+        }
+        documentEntity.getSunatResponse().setStatus("EXCEPCION");
+        documentEntity.getSunatResponse().setDescription(description);
+        documentEntity.persist();
+    }
+
+    static String failureDescription(Throwable failure) {
+        Throwable root = failure;
+        int depth = 0;
+        while (root != null && root.getCause() != null && root.getCause() != root && depth++ < 20) {
+            root = root.getCause();
+        }
+
+        String description;
+        if (root == null) {
+            description = "Unknown processing error";
+        } else {
+            description = Optional.ofNullable(root.getMessage())
+                    .filter(message -> !message.isBlank())
+                    .orElse(root.getClass().getSimpleName());
+        }
+
+        description = description
+                .replaceAll("(?i)(client_secret|password|access_token|client_id)\\s*[=:]\\s*[^\\s&,;]+", "$1=***")
+                .replaceAll("(?i)Bearer\\s+[A-Za-z0-9._~+/-]+=*", "Bearer ***")
+                .replaceAll("[\\r\\n\\t]+", " ")
+                .trim();
+        return description.length() > MAX_ERROR_DESCRIPTION_LENGTH
+                ? description.substring(0, MAX_ERROR_DESCRIPTION_LENGTH)
+                : description;
     }
 
     @Transactional
@@ -375,6 +458,7 @@ public class DocumentBean {
         UBLDocumentEntity documentEntity = documentRepository.findById(documentId);
         documentEntity.setCdrFileId(cdrFileId);
         documentEntity.setJobInProgress(false);
+        documentEntity.setError(null);
 
         documentEntity.persist();
     }

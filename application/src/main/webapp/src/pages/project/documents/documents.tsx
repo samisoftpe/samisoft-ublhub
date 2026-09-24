@@ -80,6 +80,8 @@ const getStatusType = (status?: string): StatusType => {
     return "Paused";
   } else if (status === "EXCEPCION") {
     return "Error";
+  } else if (status === "ERROR") {
+    return "Error";
   } else if (status === "RECHAZADO") {
     return "Error";
   } else {
@@ -216,6 +218,41 @@ const itemsToRow = (
                     </CardBody>
                   </Card>
                 </GridItem>
+                {item.status.error && (
+                  <GridItem>
+                    <Card>
+                      <CardTitle>Error de procesamiento</CardTitle>
+                      <CardBody>
+                        <DescriptionList>
+                          <DescriptionListGroup>
+                            <DescriptionListTerm>Fase</DescriptionListTerm>
+                            <DescriptionListDescription>
+                              {item.status.error.phase}
+                            </DescriptionListDescription>
+                          </DescriptionListGroup>
+                          <DescriptionListGroup>
+                            <DescriptionListTerm>Descripción</DescriptionListTerm>
+                            <DescriptionListDescription>
+                              {item.status.error.description}
+                            </DescriptionListDescription>
+                          </DescriptionListGroup>
+                          <DescriptionListGroup>
+                            <DescriptionListTerm>Acción sugerida</DescriptionListTerm>
+                            <DescriptionListDescription>
+                              {item.status.error.recoveryAction}
+                            </DescriptionListDescription>
+                          </DescriptionListGroup>
+                          <DescriptionListGroup>
+                            <DescriptionListTerm>Intentos fallidos</DescriptionListTerm>
+                            <DescriptionListDescription>
+                              {item.status.error.recoveryActionCount}
+                            </DescriptionListDescription>
+                          </DescriptionListGroup>
+                        </DescriptionList>
+                      </CardBody>
+                    </Card>
+                  </GridItem>
+                )}
               </Grid>
             ),
           },
