@@ -24,8 +24,8 @@ import io.github.project.openubl.ublhub.mapper.ProjectMapper;
 import io.github.project.openubl.ublhub.models.jpa.ProjectRepository;
 import io.github.project.openubl.ublhub.models.jpa.entities.ProjectEntity;
 import io.github.project.openubl.ublhub.security.Role;
+import io.github.project.openubl.ublhub.security.CurrentUserProvider;
 import io.quarkus.panache.common.Sort;
-import io.quarkus.security.identity.SecurityIdentity;
 import org.eclipse.microprofile.openapi.annotations.Operation;
 import org.jboss.resteasy.reactive.RestResponse;
 
@@ -52,7 +52,7 @@ import static org.jboss.resteasy.reactive.RestResponse.Status;
 public class ProjectResource {
 
     @Inject
-    SecurityIdentity securityIdentity;
+    CurrentUserProvider currentUserProvider;
 
     @Inject
     ProjectMapper projectMapper;
@@ -120,7 +120,7 @@ public class ProjectResource {
         projectEntity = projectMapper.updateEntityFromDto(projectDto, ProjectEntity.builder().build());
         projectEntity.persist();
 
-        String username = securityIdentity.getPrincipal().getName();
+        String username = currentUserProvider.getUsername();
         projectEntity.setProjectOwner(username);
 
         // Create default keys
@@ -134,11 +134,10 @@ public class ProjectResource {
     @GET
     @Path("/")
     public List<ProjectDto> getProjects() {
-        String username = securityIdentity.getPrincipal().getName();
-
         Sort sort = Sort.by(ProjectRepository.SortByField.name.toString(), Sort.Direction.Descending);
-        return projectRepository.listAll(username, sort)
-                .stream()
+        return currentUserProvider.getAccessibleUsernames().stream()
+                .flatMap(username -> projectRepository.listAll(username, sort).stream())
+                .distinct()
                 .map(entity -> projectMapper.toDto(entity))
                 .collect(Collectors.toList());
     }
@@ -155,9 +154,8 @@ public class ProjectResource {
                 .<ProjectDto>create(Status.NOT_FOUND)
                 .build();
 
-        String username = securityIdentity.getPrincipal().getName();
         ProjectEntity projectEntity = projectRepository.findById(projectName);
-        if (projectEntity == null || !projectEntity.hasAnyRole(username)) {
+        if (!currentUserProvider.hasAnyRole(projectEntity)) {
             return notFoundResponse.get();
         }
 
@@ -180,9 +178,8 @@ public class ProjectResource {
                 .<ProjectDto>create(Status.NOT_FOUND)
                 .build();
 
-        String username = securityIdentity.getPrincipal().getName();
         ProjectEntity projectEntity = projectRepository.findById(projectName);
-        if (projectEntity == null || !projectEntity.hasAnyRole(username, Role.owner)) {
+        if (!currentUserProvider.hasAnyRole(projectEntity, Role.owner)) {
             return notFoundResponse.get();
         }
 
@@ -205,9 +202,8 @@ public class ProjectResource {
                 .<Void>create(Status.NOT_FOUND)
                 .build();
 
-        String username = securityIdentity.getPrincipal().getName();
         ProjectEntity projectEntity = projectRepository.findById(projectName);
-        if (projectEntity == null || !projectEntity.hasAnyRole(username, Role.owner)) {
+        if (!currentUserProvider.hasAnyRole(projectEntity, Role.owner)) {
             return notFoundResponse.get();
         }
 

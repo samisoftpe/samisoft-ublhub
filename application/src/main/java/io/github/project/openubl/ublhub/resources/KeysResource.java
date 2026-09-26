@@ -45,7 +45,7 @@ import io.github.project.openubl.ublhub.models.jpa.ProjectRepository;
 import io.github.project.openubl.ublhub.models.jpa.entities.CompanyEntity;
 import io.github.project.openubl.ublhub.models.jpa.entities.ProjectEntity;
 import io.github.project.openubl.ublhub.security.Role;
-import io.quarkus.security.identity.SecurityIdentity;
+import io.github.project.openubl.ublhub.security.CurrentUserProvider;
 import org.eclipse.microprofile.openapi.annotations.Operation;
 import org.jboss.resteasy.reactive.RestResponse;
 import org.keycloak.common.util.PemUtils;
@@ -74,7 +74,7 @@ import java.util.stream.Collectors;
 public class KeysResource {
 
     @Inject
-    SecurityIdentity securityIdentity;
+    CurrentUserProvider currentUserProvider;
 
     @Context
     UriInfo uriInfo;
@@ -138,9 +138,8 @@ public class KeysResource {
     }
 
     public boolean isUserForbidden(String project, String... roles) {
-        String username = securityIdentity.getPrincipal().getName();
         ProjectEntity projectEntity = projectRepository.findById(project);
-        return projectEntity == null || !projectEntity.hasAnyRole(username, roles);
+        return !currentUserProvider.hasAnyRole(projectEntity, roles);
     }
 
     @Operation(summary = "Get project keys", description = "List of keys")

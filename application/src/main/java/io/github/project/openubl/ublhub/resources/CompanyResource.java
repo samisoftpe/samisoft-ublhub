@@ -44,8 +44,8 @@ import io.github.project.openubl.ublhub.models.jpa.ProjectRepository;
 import io.github.project.openubl.ublhub.models.jpa.entities.CompanyEntity;
 import io.github.project.openubl.ublhub.models.jpa.entities.ProjectEntity;
 import io.github.project.openubl.ublhub.security.Role;
+import io.github.project.openubl.ublhub.security.CurrentUserProvider;
 import io.quarkus.panache.common.Sort;
-import io.quarkus.security.identity.SecurityIdentity;
 import org.eclipse.microprofile.openapi.annotations.Operation;
 import org.jboss.resteasy.reactive.RestResponse;
 
@@ -72,7 +72,7 @@ import java.util.stream.Collectors;
 public class CompanyResource {
 
     @Inject
-    SecurityIdentity securityIdentity;
+    CurrentUserProvider currentUserProvider;
 
     @Context
     UriInfo uriInfo;
@@ -100,9 +100,8 @@ public class CompanyResource {
     }
 
     public boolean isUserForbidden(String project, String... roles) {
-        String username = securityIdentity.getPrincipal().getName();
         ProjectEntity projectEntity = projectRepository.findById(project);
-        return projectEntity == null || !projectEntity.hasAnyRole(username, roles);
+        return !currentUserProvider.hasAnyRole(projectEntity, roles);
     }
 
     @Operation(summary = "Get company", description = "Get one company")

@@ -52,6 +52,7 @@ import io.github.project.openubl.ublhub.models.jpa.entities.UBLDocumentEntity;
 import io.github.project.openubl.ublhub.qute.DbTemplateLocator;
 import io.github.project.openubl.ublhub.resources.utils.ResourceUtils;
 import io.github.project.openubl.ublhub.security.Role;
+import io.github.project.openubl.ublhub.security.CurrentUserProvider;
 import io.github.project.openubl.xbuilder.content.jaxb.mappers.*;
 import io.github.project.openubl.xbuilder.content.jaxb.models.*;
 import io.github.project.openubl.xsender.files.xml.XmlContent;
@@ -59,7 +60,6 @@ import io.github.project.openubl.xsender.files.xml.XmlContentProvider;
 import io.quarkus.narayana.jta.QuarkusTransaction;
 import io.quarkus.qute.Engine;
 import io.quarkus.qute.Template;
-import io.quarkus.security.identity.SecurityIdentity;
 import org.apache.camel.ProducerTemplate;
 import org.apache.camel.component.file.FileConstants;
 import org.jboss.logging.Logger;
@@ -99,7 +99,7 @@ public class DocumentResource {
     private static final Logger LOG = Logger.getLogger(DocumentResource.class);
 
     @Inject
-    SecurityIdentity securityIdentity;
+    CurrentUserProvider currentUserProvider;
 
     @Inject
     Engine engine;
@@ -150,9 +150,8 @@ public class DocumentResource {
     }
 
     public boolean isUserForbidden(String project, String... roles) {
-        String username = securityIdentity.getPrincipal().getName();
         ProjectEntity projectEntity = projectRepository.findById(project);
-        return projectEntity == null || !projectEntity.hasAnyRole(username, roles);
+        return !currentUserProvider.hasAnyRole(projectEntity, roles);
     }
 
     private RestResponse<DocumentDto> mapDocumentImportResult(String project, DocumentImportResult importResult) {
