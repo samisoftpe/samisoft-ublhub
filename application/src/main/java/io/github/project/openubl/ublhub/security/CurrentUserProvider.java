@@ -29,8 +29,10 @@ public class CurrentUserProvider {
         Set<String> usernames = new LinkedHashSet<>();
         usernames.add(SAMISOFT_SERVICE_USER);
         if (securityIdentity != null && securityIdentity.getPrincipal() != null) {
+            // With OIDC disabled the anonymous principal is "", which owns
+            // every project created before the service identity existed.
             String legacyUsername = securityIdentity.getPrincipal().getName();
-            if (legacyUsername != null && !legacyUsername.isBlank()) {
+            if (legacyUsername != null) {
                 usernames.add(legacyUsername);
             }
         }
