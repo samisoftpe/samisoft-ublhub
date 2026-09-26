@@ -16,6 +16,7 @@
  */
 package io.github.project.openubl.ublhub.documents;
 
+import io.github.project.openubl.xsender.models.Status;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -50,5 +51,31 @@ class DocumentBeanFailureTest {
         );
 
         assertEquals(255, description.length());
+    }
+
+    @Test
+    void returnsSuppressedSunatFaultInsteadOfGenericWrapper() {
+        IllegalStateException failure = new IllegalStateException(
+                "SUNAT connector returned no valid SunatResponse"
+        );
+        failure.addSuppressed(new RuntimeException("No tiene el perfil para enviar comprobantes electronicos"));
+
+        assertEquals(
+                "No tiene el perfil para enviar comprobantes electronicos",
+                DocumentBean.failureDescription(failure)
+        );
+    }
+
+    @Test
+    void convertsUnknownResponseWithoutTicketIntoException() {
+        assertEquals(Status.EXCEPCION, DocumentBean.normalizeSunatStatus(Status.UNKNOWN, null));
+        assertEquals(Status.EXCEPCION, DocumentBean.normalizeSunatStatus(null, null));
+    }
+
+    @Test
+    void preservesProcessingResponseWhenTicketExists() {
+        assertEquals(Status.UNKNOWN, DocumentBean.normalizeSunatStatus(Status.UNKNOWN, "ticket-123"));
+        assertEquals(Status.UNKNOWN, DocumentBean.normalizeSunatStatus(null, "ticket-123"));
+        assertEquals(Status.EN_PROCESO, DocumentBean.normalizeSunatStatus(Status.EN_PROCESO, "ticket-123"));
     }
 }

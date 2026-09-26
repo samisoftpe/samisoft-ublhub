@@ -53,6 +53,7 @@ import org.apache.camel.builder.RouteBuilder;
 import org.apache.camel.component.jackson.JacksonDataFormat;
 import org.apache.camel.model.dataformat.JsonLibrary;
 import org.apache.camel.support.builder.Namespaces;
+import org.apache.cxf.binding.soap.SoapFault;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 import org.jboss.logging.Logger;
 import org.xml.sax.SAXParseException;
@@ -66,6 +67,8 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static io.github.project.openubl.xsender.camel.utils.CamelUtils.getBillServiceCamelData;
 
@@ -73,6 +76,7 @@ import static io.github.project.openubl.xsender.camel.utils.CamelUtils.getBillSe
 public class DocumentRoute extends RouteBuilder {
 
     private static final Logger LOG = Logger.getLogger(DocumentRoute.class);
+    private static final Pattern SUNAT_FAULT_CODE = Pattern.compile("(?:Client|Server)\\.?(\\d+)|(\\d+)");
 
     public static final String DOCUMENT_KIND = "kind";
     public static final String DOCUMENT_PROJECT = "project";
@@ -378,7 +382,6 @@ public class DocumentRoute extends RouteBuilder {
 
                     if (isGreRest(xmlContent, documentSunatData)) {
                         exchange.getIn().setHeader(SUNAT_GRE_REST, true);
-                        exchange.getIn().setHeader(JOB_RECOVERY_ACTION, JobRecoveryActionType.RETRY_FETCH_CDR);
                         try {
                             SunatGreRestClient.GreResponse response = sunatGreRestClient.submit(
                                     documentFile,
@@ -416,7 +419,6 @@ public class DocumentRoute extends RouteBuilder {
                     camelFileData.getHeaders().forEach((k, v) -> exchange.getIn().setHeader(k, v));
                 })
 
-                .setHeader(JOB_RECOVERY_ACTION, constant(JobRecoveryActionType.RETRY_FETCH_CDR))
                 .choice()
                     .when(header(SUNAT_GRE_REST).isEqualTo(true))
                         .log(LoggingLevel.DEBUG, "GRE submitted using SUNAT REST")
@@ -431,12 +433,10 @@ public class DocumentRoute extends RouteBuilder {
                 .process(exchange -> {
                     SunatResponse sunatResponse = exchange.getIn().getBody(SunatResponse.class);
                     if (sunatResponse == null) {
-                        Object responseBody = exchange.getIn().getBody();
-                        String responseType = responseBody != null ? responseBody.getClass().getName() : "null";
-                        throw new IllegalStateException(
-                                "SUNAT connector returned no valid SunatResponse (bodyType=" + responseType
-                                        + ", httpStatus=" + safeHeader(exchange, "CamelHttpResponseCode") + ")"
-                        );
+                        sunatResponse = recoverSoapFaultResponse(exchange);
+                    }
+                    if (sunatResponse == null) {
+                        throw invalidSunatResponse(exchange, "SUNAT connector returned no valid SunatResponse");
                     }
 
                     byte[] cdrFile = Optional.ofNullable(sunatResponse.getSunat())
@@ -544,12 +544,10 @@ public class DocumentRoute extends RouteBuilder {
                 .process(exchange -> {
                     SunatResponse sunatResponse = exchange.getIn().getBody(SunatResponse.class);
                     if (sunatResponse == null) {
-                        Object responseBody = exchange.getIn().getBody();
-                        String responseType = responseBody != null ? responseBody.getClass().getName() : "null";
-                        throw new IllegalStateException(
-                                "SUNAT connector returned no valid ticket response (bodyType=" + responseType
-                                        + ", httpStatus=" + safeHeader(exchange, "CamelHttpResponseCode") + ")"
-                        );
+                        sunatResponse = recoverSoapFaultResponse(exchange);
+                    }
+                    if (sunatResponse == null) {
+                        throw invalidSunatResponse(exchange, "SUNAT connector returned no valid ticket response");
                     }
 
                     byte[] cdrFile = Optional.ofNullable(sunatResponse.getSunat())
@@ -622,6 +620,82 @@ public class DocumentRoute extends RouteBuilder {
                 safeHeader(exchange, "CamelHttpResponseCode"),
                 diagnosticHeaders(exchange)
         );
+    }
+
+    private static IllegalStateException invalidSunatResponse(Exchange exchange, String message) {
+        Object responseBody = exchange.getIn().getBody();
+        String responseType = responseBody != null ? responseBody.getClass().getName() : "null";
+        return new IllegalStateException(
+                message + " (bodyType=" + responseType
+                        + ", httpStatus=" + safeHeader(exchange, "CamelHttpResponseCode") + ")"
+        );
+    }
+
+    private static SunatResponse recoverSoapFaultResponse(Exchange exchange) {
+        Throwable failure = exchange.getProperty(Exchange.EXCEPTION_CAUGHT, Throwable.class);
+        SoapFault fault = findThrowable(failure, SoapFault.class);
+        if (fault == null) {
+            fault = findThrowable(exchange.getException(), SoapFault.class);
+        }
+        if (fault == null) {
+            return null;
+        }
+
+        SunatResponse response = toSunatFaultResponse(fault);
+        exchange.removeProperty(Exchange.EXCEPTION_CAUGHT);
+        exchange.setException(null);
+        LOG.warnf(
+                "Recovered SUNAT SOAP fault code=%s description=%s",
+                response.getMetadata().getResponseCode(),
+                response.getMetadata().getDescription()
+        );
+        return response;
+    }
+
+    static SunatResponse toSunatFaultResponse(SoapFault fault) {
+        String localCode = fault.getFaultCode() != null ? fault.getFaultCode().getLocalPart() : "";
+        Matcher matcher = SUNAT_FAULT_CODE.matcher(localCode);
+        int code = -1;
+        if (matcher.find()) {
+            String value = matcher.group(1) != null ? matcher.group(1) : matcher.group(2);
+            try {
+                code = Integer.parseInt(value);
+            } catch (NumberFormatException ignored) {
+                code = -1;
+            }
+        }
+
+        Status status = localCode.toLowerCase(Locale.ROOT).startsWith("server")
+                ? Status.EXCEPCION
+                : Status.RECHAZADO;
+        return SunatResponse.builder()
+                .status(status)
+                .metadata(Metadata.builder()
+                        .responseCode(code)
+                        .description(DocumentBean.failureDescription(fault))
+                        .notes(Collections.emptyList())
+                        .build())
+                .build();
+    }
+
+    private static <T extends Throwable> T findThrowable(Throwable failure, Class<T> type) {
+        if (failure == null) {
+            return null;
+        }
+        if (type.isInstance(failure)) {
+            return type.cast(failure);
+        }
+        T cause = failure.getCause() != failure ? findThrowable(failure.getCause(), type) : null;
+        if (cause != null) {
+            return cause;
+        }
+        for (Throwable suppressed : failure.getSuppressed()) {
+            T match = findThrowable(suppressed, type);
+            if (match != null) {
+                return match;
+            }
+        }
+        return null;
     }
 
     private static String diagnosticHeaders(Exchange exchange) {

@@ -202,8 +202,8 @@ const itemsToRow = (
                           </DescriptionListTerm>
                           <DescriptionListDescription>
                             <List>
-                              {item.status.sunat?.notes.map((e) => (
-                                <ListItem>{e}</ListItem>
+                              {item.status.sunat?.notes?.map((e) => (
+                                <ListItem key={e}>{e}</ListItem>
                               ))}
                             </List>
                           </DescriptionListDescription>

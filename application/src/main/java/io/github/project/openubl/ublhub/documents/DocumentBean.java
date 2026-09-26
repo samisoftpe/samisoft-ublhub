@@ -43,6 +43,7 @@ import io.github.project.openubl.xbuilder.signature.XMLSigner;
 import io.github.project.openubl.xbuilder.signature.XmlSignatureHelper;
 import io.github.project.openubl.xsender.files.xml.XmlContent;
 import io.github.project.openubl.xsender.files.xml.XmlContentProvider;
+import io.github.project.openubl.xsender.models.Status;
 import io.github.project.openubl.xsender.models.SunatResponse;
 import io.quarkus.qute.Template;
 import io.quarkus.runtime.annotations.RegisterForReflection;
@@ -361,22 +362,42 @@ public class DocumentBean {
         }
 
         SUNATResponseEntity sunatResponseEntity = documentEntity.getSunatResponse();
-        sunatResponseEntity.setStatus(sunatResponse.getStatus() != null ? sunatResponse.getStatus().toString() : null);
-        sunatResponseEntity.setTicket(sunatResponse.getSunat() != null ? sunatResponse.getSunat().getTicket() : null);
+        String responseTicket = sunatResponse.getSunat() != null ? sunatResponse.getSunat().getTicket() : null;
+        String effectiveTicket = responseTicket != null ? responseTicket : sunatResponseEntity.getTicket();
+        Status effectiveStatus = normalizeSunatStatus(sunatResponse.getStatus(), effectiveTicket);
+
+        if (effectiveStatus != sunatResponse.getStatus()) {
+            LOG.warnf(
+                    "Normalizing SUNAT status from %s to %s because the response has no processing ticket",
+                    sunatResponse.getStatus(),
+                    effectiveStatus
+            );
+        }
+
+        sunatResponseEntity.setStatus(effectiveStatus.toString());
+        sunatResponseEntity.setTicket(effectiveTicket);
         Optional.ofNullable(sunatResponse.getMetadata()).ifPresent(metadata -> {
             sunatResponseEntity.setCode(metadata.getResponseCode());
             sunatResponseEntity.setDescription(metadata.getDescription());
             sunatResponseEntity.setNotes(metadata.getNotes() != null ? new HashSet<>(metadata.getNotes()) : null);
         });
 
-        boolean shouldVerifyTicket = sunatResponseEntity.getTicket() != null
-                && (sunatResponse.getStatus() == null
-                || sunatResponse.getStatus() == io.github.project.openubl.xsender.models.Status.UNKNOWN
-                || sunatResponse.getStatus() == io.github.project.openubl.xsender.models.Status.EN_PROCESO);
+        boolean shouldVerifyTicket = effectiveTicket != null
+                && (effectiveStatus == Status.UNKNOWN || effectiveStatus == Status.EN_PROCESO);
         documentEntity.setJobInProgress(shouldVerifyTicket);
         documentEntity.setError(null);
 
         documentEntity.persist();
+    }
+
+    static Status normalizeSunatStatus(Status status, String ticket) {
+        if (status == null) {
+            return ticket != null ? Status.UNKNOWN : Status.EXCEPCION;
+        }
+        if (status == Status.UNKNOWN && ticket == null) {
+            return Status.EXCEPCION;
+        }
+        return status;
     }
 
     @Transactional
@@ -420,14 +441,21 @@ public class DocumentBean {
         }
         documentEntity.getSunatResponse().setStatus("EXCEPCION");
         documentEntity.getSunatResponse().setDescription(description);
+        documentEntity.getSunatResponse().setNotes(new HashSet<>());
         documentEntity.persist();
     }
 
     static String failureDescription(Throwable failure) {
         Throwable root = failure;
         int depth = 0;
-        while (root != null && root.getCause() != null && root.getCause() != root && depth++ < 20) {
-            root = root.getCause();
+        while (root != null && depth++ < 20) {
+            if (root.getCause() != null && root.getCause() != root) {
+                root = root.getCause();
+            } else if (root.getSuppressed().length > 0 && root.getSuppressed()[0] != root) {
+                root = root.getSuppressed()[0];
+            } else {
+                break;
+            }
         }
 
         String description;

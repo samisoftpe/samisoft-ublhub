@@ -40,6 +40,12 @@ public interface DocumentMapper {
     default void afterMapping(UBLDocumentEntity entity, @MappingTarget DocumentDto dto) {
         if (dto.getStatus().getSunat() != null) {
             dto.getStatus().getSunat().setHasCdr(entity.getCdrFileId() != null);
+            if (!dto.getStatus().isInProgress()
+                    && "UNKNOWN".equals(dto.getStatus().getSunat().getStatus())
+                    && (dto.getStatus().getSunat().getTicket() == null
+                    || dto.getStatus().getSunat().getTicket().isBlank())) {
+                dto.getStatus().getSunat().setStatus("EXCEPCION");
+            }
         }
     }
 
